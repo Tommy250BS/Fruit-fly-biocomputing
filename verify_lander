@@ -1,0 +1,48 @@
+import gymnasium as gym
+import numpy as np
+import torch
+from research_lander import ResearchLIFBrain
+
+# Caricamento del modello certificato
+data = torch.load("fly_lunar_lander_verified.pt")
+W_bio = data["W_bio"]
+W_out = data["W_out"]
+metrics = data["metrics"]
+
+print(
+    f"Modello Caricato. Performance Certificate OOS: {metrics['mean_oos']:.1f} ± {metrics['std_oos']:.1f}"
+)
+
+brain = ResearchLIFBrain(len(data["body_ids"]), W_bio)
+env = gym.make("LunarLander-v3", render_mode="human")
+
+# Test deterministico su seed = 123
+state, info = env.reset(seed=123)
+brain.reset_state()
+total_reward = 0.0
+
+for t in range(600):
+    env.render()
+
+    ext_I = torch.zeros(brain.N)
+    for i in range(min(8, brain.N // 2)):
+        val = state[i]
+        if val > 0:
+            ext_I[i * 2] = float(val) * 15.0
+        else:
+            ext_I[i * 2 + 1] = float(abs(val)) * 15.0
+
+    for _ in range(5):
+        brain.step(ext_I)
+
+    motor_logits = torch.mv(W_out, brain.syn_trace)
+    action = torch.argmax(motor_logits).item()
+
+    state, reward, terminated, truncated, info = env.step(action)
+    total_reward += reward
+
+    if terminated or truncated:
+        print(f"Volo terminato in {t+1} step. Punteggio totale: {total_reward:.2f}")
+        break
+
+env.close()
