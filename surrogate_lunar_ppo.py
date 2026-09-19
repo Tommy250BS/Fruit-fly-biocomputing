@@ -31,9 +31,9 @@ set_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ==============================================================================
+
 # 0. GPU-NATIVE ONLINE OBSERVATION NORMALIZER
-# ==============================================================================
+
 class TorchObsNormalizer(nn.Module):
     """Vectorized PyTorch Online Observation Normalizer running directly on GPU."""
 
@@ -71,9 +71,9 @@ class TorchObsNormalizer(nn.Module):
         return torch.clamp(norm, -self.clip, self.clip)
 
 
-# ==============================================================================
+
 # 1. SURROGATE GRADIENT FUNCTION
-# ==============================================================================
+
 class SurrogateSpike(torch.autograd.Function):
     """Discrete spike step in forward pass, Fast Sigmoid surrogate in backward pass."""
 
@@ -95,9 +95,9 @@ class SurrogateSpike(torch.autograd.Function):
 act_spike = SurrogateSpike.apply
 
 
-# ==============================================================================
+
 # 2. CONNECTOME DATA LOADER
-# ==============================================================================
+
 def load_neuprint_connectome(n_neurons: int = 100):
     token = os.environ.get("NEUPRINT_TOKEN", "")
 
@@ -145,9 +145,9 @@ def load_neuprint_connectome(n_neurons: int = 100):
     return W_bio, N, body_ids
 
 
-# ==============================================================================
+
 # 3. NORMALIZED LIF ACTOR-CRITIC MODEL
-# ==============================================================================
+
 class SpikingActorCritic(nn.Module):
 
     def __init__(self, num_neurons: int, W_bio: torch.Tensor, substeps: int = 5):
@@ -209,9 +209,9 @@ class SpikingActorCritic(nn.Module):
         return action_logits, state_value, v, syn_trace
 
 
-# ==============================================================================
+
 # 4. SOTA PPO TRAINING PIPELINE
-# ==============================================================================
+
 def make_env(env_name: str, seed: int, rank: int):
     def _thunk():
         env = gym.make(env_name)
