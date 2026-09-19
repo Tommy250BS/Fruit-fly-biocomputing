@@ -1,9 +1,13 @@
+import os
 import random
 import time
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from neuprint import Client, fetch_adjacencies, fetch_neurons, NeuronCriteria as NC
+from torch.distributions import Categorical
 
 SEED = 42
 
@@ -20,7 +24,35 @@ set_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# 1. CARICAMENTO CONNETTOMA BIOLOGICO
+# ==========================================
+# 1. FUNZIONE SURROGATE GRADIENT
+# ==========================================
+class SurrogateSpike(torch.autograd.Function):
+    """Calcola lo spike discreto nel forward pass e un'approssimazione
+
+    continua (Fast Sigmoid) nel backward pass per consentire BPTT.
+    """
+
+    @staticmethod
+    def forward(ctx, v, v_thresh):
+        ctx.save_for_backward(v, v_thresh)
+        return (v >= v_thresh).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        v, v_thresh = ctx.saved_tensors
+        alpha = 2.0
+        # Derivata della Fast Sigmoid: 1 / (1 + alpha * |v - v_thresh|)^2
+        grad_v = grad_output / (1.0 + alpha * (v - v_thresh).abs()).square()
+        return grad_v, None
+
+
+act_spike = SurrogateSpike.apply
+
+
+# ==========================================
+# 2. CARICAMENTO CONNETTOMA BIOLOGICO
+# ==========================================
 def load_neuprint_connectome(n_neurons=100):
     token = "9f913383dbd800f5078cdf27745a225f5accfff5661b4aa8b975ac7ab3322e83"
     client = Client(
@@ -30,9 +62,7 @@ def load_neuprint_connectome(n_neurons=100):
     neurons, _ = fetch_neurons(NC(rois=["EB", "FB"]))
     selected_neurons = neurons.head(n_neurons)
     body_ids = selected_neurons["bodyId"].tolist()
-    neuron_df, conn_df = fetch_adjacencies(
-        NC(bodyId=body_ids), NC(bodyId=body_ids)
-    )
+    _, conn_df = fetch_adjacencies(NC(bodyId=body_ids), NC(bodyId=body_ids))
 
     N = len(body_ids)
     W_bio = np.zeros((N, N), dtype=np.float32)
@@ -57,179 +87,197 @@ def load_neuprint_connectome(n_neurons=100):
     return torch.tensor(W_bio, dtype=torch.float32, device=device), N, body_ids
 
 
-# 2. LIF BRAIN CON ECCITABILITÀ PLASTICA
-class PlasticLIFBrain:
+# ==========================================
+# 3. MODELLO LIF ACTOR-CRITIC DIFFERENZIABILE
+# ==========================================
+class SpikingActorCritic(nn.Module):
 
-    def __init__(self, N, W_bio, dt=1.0):
+    def __init__(self, N, W_bio, substeps=5):
+        super().__init__()
         self.N = N
-        self.W = W_bio
+        self.substeps = substeps
+
+        # Parametri biologici del neurone LIF
         self.v_rest = -70.0
         self.v_thresh = -50.0
         self.v_reset = -75.0
         self.tau_m = 10.0
         self.tau_s = 10.0
-        self.dt = dt
-        self.reset_state()
 
-    def reset_state(self):
-        self.v = torch.full((self.N,), self.v_rest, device=device)
-        self.syn_trace = torch.zeros(self.N, device=device)
+        # Strati di proiezione ed encodere
+        self.fc_in = nn.Linear(8, N)
 
-    def step(self, external_current, gains, biases):
-        # Applicazione dell'eccitabilità intrinseca modulatrice
-        i_eff = external_current * gains + biases
+        # Matrice connettoma: inizializzata da W_bio con un vincolo di regolarizzazione Soft
+        self.W_rec = nn.Parameter(W_bio.clone())
+        self.W_bio_ref = W_bio.clone().detach()
 
-        synaptic_input = torch.mv(self.W, self.syn_trace)
-        dv = (-(self.v - self.v_rest) + i_eff + synaptic_input) / self.tau_m
-        self.v += dv * self.dt
+        # Testate Actor e Critic basate sulle tracce sinaptiche
+        self.actor_head = nn.Linear(N, 4)
+        self.critic_head = nn.Linear(N, 1)
 
-        spikes = (self.v >= self.v_thresh).float()
-        self.v[spikes.bool()] = self.v_reset
+    def forward_step(self, obs, v, syn_trace):
+        """Esegue substeps temporali di unroll BPTT per un singolo step di ambiente."""
+        I_ext = self.fc_in(obs) * 10.0
 
-        self.syn_trace = self.syn_trace * (1.0 - self.dt / self.tau_s) + spikes
-        return spikes
+        for _ in range(self.substeps):
+            synaptic_input = torch.matmul(syn_trace, self.W_rec.t())
+            dv = (-(v - self.v_rest) + I_ext + synaptic_input) / self.tau_m
+            v = v + dv
+
+            spikes = act_spike(v, self.v_thresh)
+
+            # Reset del potenziale post-spike
+            v = v * (1.0 - spikes) + self.v_reset * spikes
+
+            # Integrale della traccia sinaptica
+            syn_trace = syn_trace * (1.0 - 1.0 / self.tau_s) + spikes
+
+        action_logits = self.actor_head(syn_trace)
+        state_value = self.critic_head(syn_trace)
+
+        return action_logits, state_value, v, syn_trace
 
 
-# 3. VALUTAZIONE RIGOROSA CON FILTRO AZIONE PASSA-BASSO
-def evaluate_genome(brain, genome, seeds, max_steps=800) -> list:
-    """Genome vettorizzato:
-    - W_out: 4 x N (400 params)
-    - Gains (g): N params
-    - Biases (b): N params
-    """
-    N = brain.N
-    W_out = genome[: 4 * N].reshape(4, N)
-    gains = genome[4 * N : 5 * N]
-    biases = genome[5 * N : 6 * N]
+# ==========================================
+# 4. LOOP DI ADDESTRAMENTO PPO
+# ==========================================
+def train_ppo():
+    print("=== INIZIO TRAINING SNN-PPO CON SURROGATE GRADIENT BPTT ===")
+    W_bio, N, body_ids = load_neuprint_connectome(100)
+    model = SpikingActorCritic(N, W_bio).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
     env = gym.make("LunarLander-v3")
-    rewards = []
 
-    for seed in seeds:
-        state, info = env.reset(seed=seed)
-        brain.reset_state()
-        total_reward = 0.0
-        prev_action_logits = torch.zeros(4, device=device)
+    MAX_EPISODES = 400
+    STEPS_PER_UPDATE = 2048
+    GAMMA = 0.99
+    GAE_LAMBDA = 0.95
+    PPO_EPOCHS = 10
+    CLIP_EPS = 0.2
 
-        for _ in range(max_steps):
-            ext_I = torch.zeros(N, device=device)
-            for i in range(min(8, N // 2)):
-                val = state[i]
-                if val > 0:
-                    ext_I[i * 2] = float(val) * 10.0
-                else:
-                    ext_I[i * 2 + 1] = float(abs(val)) * 10.0
+    best_reward = -float("inf")
 
-            for _ in range(5):
-                brain.step(ext_I, gains, biases)
+    for episode in range(1, MAX_EPISODES + 1):
+        obs, _ = env.reset()
+        obs = torch.tensor(obs, dtype=torch.float32, device=device)
 
-            raw_logits = torch.mv(W_out, brain.syn_trace)
-            # Filtro passa-basso cinetico (Alpha = 0.3) per eliminare il chattering motorio
-            action_logits = 0.7 * prev_action_logits + 0.3 * raw_logits
-            prev_action_logits = action_logits.clone()
+        # Inizializzazione stato neurale
+        v = torch.full((N,), model.v_rest, device=device)
+        syn_trace = torch.zeros(N, device=device)
 
-            action = torch.argmax(action_logits).item()
+        states, actions, log_probs, rewards, values, masks = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        ep_reward = 0.0
 
-            state, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
+        for _ in range(STEPS_PER_UPDATE):
+            logits, value, v, syn_trace = model.forward_step(
+                obs, v.detach(), syn_trace.detach()
+            )
+            dist = Categorical(logits=logits)
+            action = dist.sample()
 
-            if terminated or truncated:
-                break
+            next_obs, reward, terminated, truncated, _ = env.step(action.item())
+            done = terminated or truncated
 
-        rewards.append(total_reward)
+            states.append(obs)
+            actions.append(action)
+            log_probs.append(dist.log_prob(action))
+            values.append(value.squeeze(-1))
+            rewards.append(reward)
+            masks.append(1.0 - float(done))
 
-    env.close()
-    return rewards
+            ep_reward += reward
+            obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
+            if done:
+                obs, _ = env.reset()
+                obs = torch.tensor(obs, dtype=torch.float32, device=device)
+                v = torch.full((N,), model.v_rest, device=device)
+                syn_trace = torch.zeros(N, device=device)
 
-# 4. RUNNER PRINCIPALE
-def main():
-    print("=== PIPELINE RICERCA v2.0: CMA-ES + INTRINSIC EXCITABILITY ===")
-    W_bio, N, body_ids = load_neuprint_connectome(100)
-    brain = PlasticLIFBrain(N, W_bio)
+        # Calcolo GAE (Generalized Advantage Estimation)
+        with torch.no_grad():
+            _, next_value, _, _ = model.forward_step(obs, v, syn_trace)
+            next_value = next_value.squeeze(-1)
 
-    # Vettore dei parametri: W_out (400) + Gains (100) + Biases (100) = 600 parametri
-    PARAM_DIM = 4 * N + N + N
-    POP_SIZE = 32
-    GENERATIONS = 120
-    SIGMA = 0.2
+        returns = []
+        gae = 0.0
+        for i in reversed(range(len(rewards))):
+            delta = (
+                rewards[i]
+                + GAMMA * next_value * masks[i]
+                - values[i].detach()
+            )
+            gae = delta + GAMMA * GAE_LAMBDA * masks[i] * gae
+            next_value = values[i].detach()
+            returns.insert(0, gae + values[i].detach())
 
-    # Inizializzazione centro della popolazione
-    mean_genome = torch.zeros(PARAM_DIM, device=device)
-    mean_genome[: 4 * N] = torch.randn(4 * N, device=device) * 0.1  # W_out
-    mean_genome[4 * N : 5 * N] = 1.0  # Gains
-    mean_genome[5 * N : 6 * N] = 0.0  # Biases
-
-    best_overall_score = -float("inf")
-    best_genome = mean_genome.clone()
-
-    for gen in range(1, GENERATIONS + 1):
-        gen_seeds = [int(SEED * 5000 + gen * 50 + i) for i in range(10)]
-
-        # Generazione popolazione con perturbazioni sferiche
-        noise_samples = [
-            torch.randn(PARAM_DIM, device=device) for _ in range(POP_SIZE)
-        ]
-        candidates = [mean_genome + SIGMA * noise for noise in noise_samples]
-        candidates.append(mean_genome)
-
-        scores = [
-            np.mean(evaluate_genome(brain, cand, gen_seeds))
-            for cand in candidates
-        ]
-
-        cand_scores = scores[:-1]
-        mean_score = scores[-1]
-
-        # Aggiornamento adattivo NES/CMA
-        score_tensor = torch.tensor(cand_scores, device=device)
-        std_val = score_tensor.std() + 1e-8
-        norm_scores = (score_tensor - score_tensor.mean()) / std_val
-
-        update = torch.zeros(PARAM_DIM, device=device)
-        for i in range(POP_SIZE):
-            update += norm_scores[i] * noise_samples[i]
-
-        mean_genome += (0.08 / (POP_SIZE * SIGMA)) * update
-
-        max_score = np.max(scores)
-        print(
-            f"Gen {gen:03d}/{GENERATIONS} | Score Medio: {mean_score:6.1f} | Max Gen: {max_score:6.1f}"
+        b_states = torch.stack(states)
+        b_actions = torch.stack(actions)
+        b_log_probs = torch.stack(log_probs).detach()
+        b_returns = torch.tensor(returns, device=device)
+        b_advantages = b_returns - torch.stack(values).detach()
+        b_advantages = (b_advantages - b_advantages.mean()) / (
+            b_advantages.std() + 1e-8
         )
 
-        if max_score > best_overall_score:
-            best_overall_score = max_score
-            best_genome = candidates[np.argmax(scores)].clone()
+        # Aggiornamento PPO
+        for _ in range(PPO_EPOCHS):
+            v_dummy = torch.full((N,), model.v_rest, device=device)
+            syn_dummy = torch.zeros(N, device=device)
 
-    # 5. VALIDAZIONE FINALE SU 50 SEED SCONOSCIUTI
-    print("\n" + "=" * 50)
-    print(" CROSS-VALIDAZIONE OOS FINALE (50 SEED)")
-    print("=" * 50)
+            logits, new_values, _, _ = model.forward_step(
+                b_states, v_dummy, syn_dummy
+            )
+            dist = Categorical(logits=logits)
+            new_log_probs = dist.log_prob(b_actions)
 
-    oos_seeds = [int(888000 + i) for i in range(50)]
-    oos_rewards = evaluate_genome(brain, best_genome, oos_seeds)
+            ratios = torch.exp(new_log_probs - b_log_probs)
+            surr1 = ratios * b_advantages
+            surr2 = (
+                torch.clamp(ratios, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
+                * b_advantages
+            )
 
-    mean_oos = np.mean(oos_rewards)
-    std_oos = np.std(oos_rewards)
-    success_rate = (
-        np.sum(np.array(oos_rewards) >= 200.0) / len(oos_rewards)
-    ) * 100.0
+            actor_loss = -torch.min(surr1, surr2).mean()
+            critic_loss = nn.MSELoss()(new_values.squeeze(-1), b_returns)
 
-    print(f"Risultati Finali Certificati:")
-    print(f" -> Media OOS:          {mean_oos:.2f} ± {std_oos:.2f}")
-    print(f" -> Max Reward:         {np.max(oos_rewards):.1f}")
-    print(f" -> Tasso Atterraggio: {success_rate:.1f}% (Punteggio >= 200)")
+            # Penale L2 per mantenere la matrice vicina alla topologia biologica originale W_bio
+            bio_preservation_loss = 0.01 * torch.norm(
+                model.W_rec - model.W_bio_ref
+            )
 
-    torch.save(
-        {
-            "W_bio": W_bio.cpu(),
-            "genome": best_genome.cpu(),
-            "body_ids": body_ids,
-            "metrics": {"mean_oos": mean_oos, "success_rate": success_rate},
-        },
-        "fly_lunar_lander_v2_verified.pt",
-    )
+            loss = actor_loss + 0.5 * critic_loss + bio_preservation_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            optimizer.step()
+
+        avg_ep_reward = ep_reward / (
+            STEPS_PER_UPDATE / 200.0
+        )  # Stima normalizzata
+        print(
+            f"Update {episode:03d}/{MAX_EPISODES} | Reward Medio Reale: {avg_ep_reward:6.1f} | Loss: {loss.item():.4f}"
+        )
+
+        if avg_ep_reward > best_reward:
+            best_reward = avg_ep_reward
+            torch.save(
+                {"model_state": model.state_dict(), "body_ids": body_ids},
+                "snn_ppo_lunar_winner.pt",
+            )
+
+    env.close()
+    print("\nTraining Completato. Salvataggio checkpoint in 'snn_ppo_lunar_winner.pt'.")
 
 
 if __name__ == "__main__":
-    main()
+    train_ppo()
