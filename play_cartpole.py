@@ -3,9 +3,8 @@ import gymnasium as gym
 import numpy as np
 from neuprint import Client, fetch_adjacencies, fetch_neurons, NeuronCriteria as NC
 
-# ==========================================
 # 1. CONNESSIONE E MATRICE BIOLOGICA FISSA
-# ==========================================
+
 token = "9f913383dbd800f5078cdf27745a225f5accfff5661b4aa8b975ac7ab3322e83"
 client = Client(
     "https://neuprint.janelia.org", dataset="male-cns:v1.0", token=token
@@ -34,9 +33,8 @@ if W_bio.max() > 0:
     W_bio = W_bio / W_bio.max()
 
 
-# ==========================================
 # 2. MODELLO NEURONALE (LIF)
-# ==========================================
+
 class ReservoirBrain:
 
     def __init__(self, N_neurons, weight_matrix):
@@ -65,9 +63,8 @@ class ReservoirBrain:
         return spikes
 
 
-# ==========================================
 # 3. ADDESTRAMENTO AD ALTA VELOCITÀ
-# ==========================================
+
 # Nessun render_mode -> Zero overhead grafico
 env = gym.make("CartPole-v1")
 brain = ReservoirBrain(N, W_bio)
