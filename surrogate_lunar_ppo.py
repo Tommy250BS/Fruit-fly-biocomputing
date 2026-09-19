@@ -1,6 +1,8 @@
+import os
 import random
 import time
 from collections import deque
+
 import gymnasium as gym
 import numpy as np
 import torch
@@ -9,7 +11,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 try:
-    from neuprint import Client, fetch_adjacencies, fetch_neurons, NeuronCriteria as NC
+    from neuprint import Client, fetch_adjacencies, fetch_neurons, NC
     HAS_NEUPRINT = True
 except ImportError:
     HAS_NEUPRINT = False
@@ -17,7 +19,7 @@ except ImportError:
 SEED = 42
 
 
-def set_seed(seed=42):
+def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -29,50 +31,60 @@ set_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ==========================================
-# 0. NORMALIZZATORE ONLINE DEGLI STATI (VECTORIZED)
-# ==========================================
-class ObsNormalizer:
-    """Normalizza le osservazioni dell'ambiente per evitare saturazione dei neuroni SNN."""
+# ==============================================================================
+# 0. GPU-NATIVE ONLINE OBSERVATION NORMALIZER
+# ==============================================================================
+class TorchObsNormalizer(nn.Module):
+    """Vectorized PyTorch Online Observation Normalizer running directly on GPU."""
 
-    def __init__(self, shape, eps=1e-8):
-        self.mean = np.zeros(shape, dtype=np.float32)
-        self.var = np.ones(shape, dtype=np.float32)
-        self.count = eps
+    def __init__(self, shape: tuple[int, ...], eps: float = 1e-8, clip: float = 5.0):
+        super().__init__()
+        self.eps = eps
+        self.clip = clip
+        self.register_buffer("mean", torch.zeros(shape, device=device))
+        self.register_buffer("var", torch.ones(shape, device=device))
+        self.register_buffer("count", torch.tensor(eps, device=device))
 
-    def update(self, x):
-        batch_mean = np.mean(x, axis=0)
-        batch_var = np.var(x, axis=0)
-        batch_count = x.shape[0] if x.ndim > 1 else 1
+    @torch.no_grad()
+    def update(self, x: torch.Tensor):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        batch_mean = torch.mean(x, dim=0)
+        batch_var = torch.var(x, dim=0, unbiased=False)
+        batch_count = x.size(0)
 
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
 
-        self.mean = self.mean + delta * batch_count / tot_count
+        new_mean = self.mean + delta * batch_count / tot_count
         m_a = self.var * self.count
         m_b = batch_var * batch_count
-        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
-        self.var = M2 / tot_count
-        self.count = tot_count
+        m_2 = m_a + m_b + torch.square(delta) * self.count * batch_count / tot_count
+        new_var = m_2 / tot_count
 
-    def filter(self, x):
-        return np.clip((x - self.mean) / (np.sqrt(self.var) + 1e-8), -5.0, 5.0)
+        self.mean.copy_(new_mean)
+        self.var.copy_(new_var)
+        self.count.copy_(tot_count)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        norm = (x - self.mean) / (torch.sqrt(self.var) + self.eps)
+        return torch.clamp(norm, -self.clip, self.clip)
 
 
-# ==========================================
-# 1. FUNZIONE SURROGATE GRADIENT
-# ==========================================
+# ==============================================================================
+# 1. SURROGATE GRADIENT FUNCTION
+# ==============================================================================
 class SurrogateSpike(torch.autograd.Function):
-    """Calcola lo spike discreto nel forward pass e Fast Sigmoid nel backward pass."""
+    """Discrete spike step in forward pass, Fast Sigmoid surrogate in backward pass."""
 
     @staticmethod
-    def forward(ctx, v, v_thresh):
+    def forward(ctx, v: torch.Tensor, v_thresh: float = 1.0) -> torch.Tensor:
         ctx.save_for_backward(v)
         ctx.v_thresh = v_thresh
         return (v >= v_thresh).float()
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output: torch.Tensor):
         (v,) = ctx.saved_tensors
         v_thresh = ctx.v_thresh
         alpha = 2.0
@@ -83,13 +95,13 @@ class SurrogateSpike(torch.autograd.Function):
 act_spike = SurrogateSpike.apply
 
 
-# ==========================================
-# 2. CARICAMENTO CONNETTOMA BIOLOGICO
-# ==========================================
-def load_neuprint_connectome(n_neurons=100):
-    token = "9f913383dbd800f5078cdf27745a225f5accfff5661b4aa8b975ac7ab3322e83"
+# ==============================================================================
+# 2. CONNECTOME DATA LOADER
+# ==============================================================================
+def load_neuprint_connectome(n_neurons: int = 100):
+    token = os.environ.get("NEUPRINT_TOKEN", "")
 
-    if HAS_NEUPRINT:
+    if HAS_NEUPRINT and token:
         try:
             client = Client("https://neuprint.janelia.org", dataset="male-cns:v1.0", token=token)
             neurons, _ = fetch_neurons(NC(rois=["EB", "FB"]))
@@ -117,72 +129,74 @@ def load_neuprint_connectome(n_neurons=100):
             if max_val > 0:
                 W_bio /= max_val
 
-            print(f"[Neuprint] Connettoma caricato con successo ({N} neuroni).")
+            print(f"[Neuprint] Connectome loaded successfully ({N} neurons).")
             return torch.tensor(W_bio, dtype=torch.float32, device=device), N, body_ids
         except Exception as e:
-            print(f"[Neuprint Warning] Connessione non riuscita ({e}). Generazione matrice sintetizzata.")
+            print(f"[Neuprint Warning] Connection failed ({e}). Generating synthetic connectome.")
 
+    # Biologically plausible Dale's Law matrix: 80% Excitatory, 20% Inhibitory
     N = n_neurons
-    W_bio = torch.randn(N, N, device=device) * 0.1
+    W_bio = torch.randn(N, N, device=device) * 0.15
+    inhib_mask = torch.rand(N, device=device) < 0.2
+    W_bio[:, inhib_mask] = -torch.abs(W_bio[:, inhib_mask])
+    W_bio[:, ~inhib_mask] = torch.abs(W_bio[:, ~inhib_mask])
+    W_bio.fill_diagonal_(0.0)
     body_ids = [1000 + i for i in range(N)]
     return W_bio, N, body_ids
 
 
-# ==========================================
-# 3. MODELLO LIF ACTOR-CRITIC DUAL-READOUT
-# ==========================================
+# ==============================================================================
+# 3. NORMALIZED LIF ACTOR-CRITIC MODEL
+# ==============================================================================
 class SpikingActorCritic(nn.Module):
 
-    def __init__(self, N, W_bio, substeps=5):
+    def __init__(self, num_neurons: int, W_bio: torch.Tensor, substeps: int = 5):
         super().__init__()
-        self.N = N
+        self.num_neurons = num_neurons
         self.substeps = substeps
 
-        # Parametri biologici del neurone LIF
-        self.v_rest = -70.0
-        self.v_thresh = -50.0
-        self.v_reset = -75.0
-        self.tau_m = 10.0
-        self.tau_s = 10.0
+        # Normalized LIF Dynamics Parameters
+        self.v_thresh = 1.0
+        self.decay_m = 0.85  # Membrane potential decay factor
+        self.decay_s = 0.85  # Synaptic trace decay factor
 
-        # Strato di proiezione con bilanciamento ortogonale
-        self.fc_in = nn.Linear(8, N)
+        # Input Projection Layer
+        self.fc_in = nn.Linear(8, num_neurons)
         nn.init.orthogonal_(self.fc_in.weight, gain=1.4)
         nn.init.zeros_(self.fc_in.bias)
 
-        # Matrice del connettoma
+        # Connectome Recurrent Layer
         self.W_rec = nn.Parameter(W_bio.clone())
-        self.W_bio_ref = W_bio.clone().detach()
+        self.register_buffer("W_bio_ref", W_bio.clone().detach())
 
-        # Output Heads (Ingresso combinato: Synaptic Trace + Spike Rate)
-        self.actor_head = nn.Linear(N * 2, 4)
+        # Dual Readout Heads (Synaptic Trace + Spike Rate)
+        feat_dim = num_neurons * 2
+        self.actor_head = nn.Linear(feat_dim, 4)
         nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
         nn.init.zeros_(self.actor_head.bias)
 
-        self.critic_head = nn.Linear(N * 2, 1)
+        self.critic_head = nn.Linear(feat_dim, 1)
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
         nn.init.zeros_(self.critic_head.bias)
 
-    def forward_step(self, obs, v, syn_trace):
+    def forward_step(self, obs: torch.Tensor, v: torch.Tensor, syn_trace: torch.Tensor):
         is_single = (obs.dim() == 1)
         if is_single:
             obs = obs.unsqueeze(0)
             v = v.unsqueeze(0)
             syn_trace = syn_trace.unsqueeze(0)
 
-        I_ext = self.fc_in(obs) * 12.0
+        I_ext = self.fc_in(obs)
         spike_sum = torch.zeros_like(v)
 
         for _ in range(self.substeps):
             synaptic_input = torch.matmul(syn_trace, self.W_rec.t())
-            dv = (-(v - self.v_rest) + I_ext + synaptic_input) / self.tau_m
-            v = v + dv
-
+            v = v * self.decay_m + I_ext + synaptic_input
             spikes = act_spike(v, self.v_thresh)
             spike_sum = spike_sum + spikes
 
-            v = v * (1.0 - spikes) + self.v_reset * spikes
-            syn_trace = syn_trace * (1.0 - 1.0 / self.tau_s) + spikes
+            v = v * (1.0 - spikes)  # Reset upon spiking
+            syn_trace = syn_trace * self.decay_s + spikes
 
         spike_rate = spike_sum / float(self.substeps)
         feat = torch.cat([syn_trace, spike_rate], dim=-1)
@@ -195,10 +209,10 @@ class SpikingActorCritic(nn.Module):
         return action_logits, state_value, v, syn_trace
 
 
-# ==========================================
-# 4. LOOP DI ADDESTRAMENTO PPO SOTA
-# ==========================================
-def make_env(env_name, seed, rank):
+# ==============================================================================
+# 4. SOTA PPO TRAINING PIPELINE
+# ==============================================================================
+def make_env(env_name: str, seed: int, rank: int):
     def _thunk():
         env = gym.make(env_name)
         env.action_space.seed(seed + rank)
@@ -207,51 +221,48 @@ def make_env(env_name, seed, rank):
 
 
 def train_ppo():
-    print("=== INIZIO TRAINING SNN-PPO SOTA (LUNAR LANDER +200 TARGET) ===")
+    print("=== STARTING SNN-PPO LUNAR LANDER TRAINING ===")
     W_bio, N, body_ids = load_neuprint_connectome(100)
     model = SpikingActorCritic(N, W_bio).to(device)
 
-    # Parametri SOTA di Schedulazione ed Esplorazione
     NUM_ENVS = 8
-    NUM_STEPS = 256  # 8 envs * 256 steps = 2048 campioni per update
-    TOTAL_TIMESTEPS = 819200  # 400 updates equivalenti
+    NUM_STEPS = 256
+    TOTAL_TIMESTEPS = 819200
     MAX_UPDATES = TOTAL_TIMESTEPS // (NUM_ENVS * NUM_STEPS)
 
     LR_INIT = 3e-4
-    LR_FINAL = 5e-5
-    ENTROPY_START = 0.020
-    ENTROPY_FLOOR = 0.008
+    LR_FINAL = 3e-5
+    ENTROPY_START = 0.02
+    ENTROPY_FLOOR = 0.005
 
     BATCH_SIZE = 64
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     PPO_EPOCHS = 10
-    CLIP_EPS = 0.15          # Clipping conservativo per gradienti SNN
-    TARGET_KL = 0.015         # Early Stopping KL per prevenire regressione
-    MAX_GRAD_NORM = 0.5       # Gradient norm clipping
+    CLIP_EPS = 0.15
+    TARGET_KL = 0.015
+    MAX_GRAD_NORM = 0.5
     VF_COEF = 0.5
 
     optimizer = optim.Adam(model.parameters(), lr=LR_INIT, eps=1e-5)
 
     env_name = "LunarLander-v3" if "LunarLander-v3" in gym.envs.registry else "LunarLander-v2"
     envs = gym.vector.SyncVectorEnv([make_env(env_name, SEED, i) for i in range(NUM_ENVS)])
-    obs_normalizer = ObsNormalizer(shape=(8,))
+    obs_normalizer = TorchObsNormalizer(shape=(8,)).to(device)
 
     recent_ep_rewards = deque(maxlen=100)
     ep_rewards_tracker = np.zeros(NUM_ENVS, dtype=np.float32)
     best_reward = -float("inf")
 
-    # Inizializzazione stati ambienti
     raw_obs, _ = envs.reset(seed=SEED)
-    obs_normalizer.update(raw_obs)
-    norm_obs = obs_normalizer.filter(raw_obs)
-    obs_tensor = torch.tensor(norm_obs, dtype=torch.float32, device=device)
+    raw_obs_tensor = torch.tensor(raw_obs, dtype=torch.float32, device=device)
+    obs_normalizer.update(raw_obs_tensor)
+    obs_tensor = obs_normalizer.normalize(raw_obs_tensor)
 
-    v = torch.full((NUM_ENVS, N), model.v_rest, device=device)
+    v = torch.zeros((NUM_ENVS, N), device=device)
     syn_trace = torch.zeros((NUM_ENVS, N), device=device)
 
     for update in range(1, MAX_UPDATES + 1):
-        # Linear decay con limiti minimi (Floor)
         progress = (update - 1) / float(MAX_UPDATES)
         lr_now = max(LR_FINAL, LR_INIT * (1.0 - progress))
         entropy_coef_now = max(ENTROPY_FLOOR, ENTROPY_START * (1.0 - progress))
@@ -259,7 +270,6 @@ def train_ppo():
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr_now
 
-        # Buffer delle traiettorie
         b_states = torch.zeros((NUM_STEPS, NUM_ENVS, 8), device=device)
         b_v_in = torch.zeros((NUM_STEPS, NUM_ENVS, N), device=device)
         b_syn_in = torch.zeros((NUM_STEPS, NUM_ENVS, N), device=device)
@@ -269,7 +279,7 @@ def train_ppo():
         b_values = torch.zeros((NUM_STEPS, NUM_ENVS), device=device)
         b_masks = torch.zeros((NUM_STEPS, NUM_ENVS), device=device)
 
-        # --- FASE 1: ROLLOUT PARALLELIZZATO ---
+        # Rollout Phase
         for step in range(NUM_STEPS):
             b_states[step] = obs_tensor
             b_v_in[step] = v.clone()
@@ -295,18 +305,17 @@ def train_ppo():
                 if done:
                     recent_ep_rewards.append(ep_rewards_tracker[env_idx])
                     ep_rewards_tracker[env_idx] = 0.0
-                    # Reset selettivo dello stato SNN solo per gli ambienti terminati
-                    v_next[env_idx] = model.v_rest
+                    v_next[env_idx] = 0.0
                     syn_next[env_idx] = 0.0
 
             v = v_next
             syn_trace = syn_next
 
-            obs_normalizer.update(next_raw_obs)
-            norm_next_obs = obs_normalizer.filter(next_raw_obs)
-            obs_tensor = torch.tensor(norm_next_obs, dtype=torch.float32, device=device)
+            next_obs_tensor = torch.tensor(next_raw_obs, dtype=torch.float32, device=device)
+            obs_normalizer.update(next_obs_tensor)
+            obs_tensor = obs_normalizer.normalize(next_obs_tensor)
 
-        # --- FASE 2: CALCOLO GAE ---
+        # GAE Advantage Estimation
         with torch.no_grad():
             _, next_value, _, _ = model.forward_step(obs_tensor, v, syn_trace)
             next_value = next_value.squeeze(-1)
@@ -328,7 +337,7 @@ def train_ppo():
 
         returns = advantages + b_values
 
-        # appiattimento buffer per il mini-batch SGD
+        # Buffer Flattening
         flat_states = b_states.reshape(-1, 8)
         flat_v_in = b_v_in.reshape(-1, N)
         flat_syn_in = b_syn_in.reshape(-1, N)
@@ -338,10 +347,9 @@ def train_ppo():
         flat_advantages = advantages.reshape(-1)
         flat_values = b_values.reshape(-1).detach()
 
-        # Normalizzazione vantaggi
         flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
 
-        # --- FASE 3: OPTIMIZATION LOOP CON TARGET KL ---
+        # SGD Optimization Loop
         dataset_size = NUM_STEPS * NUM_ENVS
         indices = np.arange(dataset_size)
         total_loss_accum = 0.0
@@ -372,7 +380,6 @@ def train_ppo():
                 log_ratio = new_log_probs - mb_log_probs
                 ratios = torch.exp(log_ratio)
 
-                # Calcolo della KL Divergence per interrompere gli update distruttivi
                 with torch.no_grad():
                     approx_kl = ((ratios - 1) - log_ratio).mean()
 
@@ -380,21 +387,17 @@ def train_ppo():
                     kl_stopped = True
                     break
 
-                # Policy Loss
                 surr1 = ratios * mb_advantages
                 surr2 = torch.clamp(ratios, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * mb_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
 
-                # Value Loss con Clipping
                 new_val = new_values.squeeze(-1)
                 v_clipped = mb_values + torch.clamp(new_val - mb_values, -CLIP_EPS, CLIP_EPS)
                 v_loss_unclipped = (new_val - mb_returns).pow(2)
                 v_loss_clipped = (v_clipped - mb_returns).pow(2)
                 critic_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-                # Preservazione della struttura connettomica biologica
                 bio_preservation_loss = 0.0005 * torch.norm(model.W_rec - model.W_bio_ref)
-
                 total_loss = actor_loss + VF_COEF * critic_loss - entropy_coef_now * entropy + bio_preservation_loss
 
                 optimizer.zero_grad()
@@ -410,14 +413,13 @@ def train_ppo():
 
         avg_reward_100 = np.mean(recent_ep_rewards) if len(recent_ep_rewards) > 0 else -999.0
         avg_loss = total_loss_accum / max(1, num_batches)
-
         kl_status = " [KL Stop]" if kl_stopped else ""
+
         print(
             f"Update {update:03d}/{MAX_UPDATES} | LR: {lr_now:.2e} | "
-            f"Entropia: {entropy_coef_now:.4f} | Reward Medio (100 Ep): {avg_reward_100:6.1f} | Loss: {avg_loss:.4f}{kl_status}"
+            f"Entropy: {entropy_coef_now:.4f} | Avg Reward (100 Ep): {avg_reward_100:6.1f} | Loss: {avg_loss:.4f}{kl_status}"
         )
 
-        # Salvataggio dinamico del miglior modello
         if avg_reward_100 > best_reward and len(recent_ep_rewards) >= 20:
             best_reward = avg_reward_100
             torch.save(
@@ -425,10 +427,10 @@ def train_ppo():
                 "snn_ppo_lunar_winner.pt",
             )
             if avg_reward_100 >= 200.0:
-                print(f"\n TRAGUARDO RAGGIUNTO! Media 100 Episodi: {avg_reward_100:.2f}. Modello SOTA salvato.")
+                print(f"\nTARGET REACHED! 100-Episode Average Reward: {avg_reward_100:.2f}. Model saved.")
 
     envs.close()
-    print(f"\nTraining Completato. Best 100-Ep Average Reward: {best_reward:.1f}")
+    print(f"\nTraining Complete. Best 100-Ep Average Reward: {best_reward:.1f}")
 
 
 if __name__ == "__main__":
